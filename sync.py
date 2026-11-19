@@ -1,5 +1,6 @@
 import os
 import io
+import hashlib
 import socket
 import ftplib
 import time
@@ -17,7 +18,6 @@ ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 
 KYIV_TZ = timezone(timedelta(hours=2))
 
-# Переносимо та оновлюємо лише файли, у назві яких є ці слова (без урахування регістру)
 ALLOWED_FILES = ("storm", "avia", "hydrs", "aadd")
 
 
@@ -61,7 +61,7 @@ def get_or_create_folder(service, name, parent_id):
 
 
 def get_existing_files(service, folder_id):
-    """Повертає словник {ім'я_файлу: {'id': ..., 'ftp_mdtm': ..., 'ftp_size': ...}}"""
+    """Отримує список файлів на Диску разом із SHA-256 та збереженою FTP-сигнатурою"""
     existing = {}
     page_token = None
     while True:
@@ -70,7 +70,7 @@ def get_existing_files(service, folder_id):
             service.files()
             .list(
                 q=query,
-                fields="nextPageToken, files(id, name, size, appProperties)",
+                fields="nextPageToken, files(id, name, sha256Checksum, appProperties)",
                 pageSize=1000,
                 pageToken=page_token,
             )
@@ -78,10 +78,11 @@ def get_existing_files(service, folder_id):
         )
         for f in response.get("files", []):
             props = f.get("appProperties") or {}
+            saved_hash = f.get("sha256Checksum") or props.get("content_sha256", "")
             existing[f["name"]] = {
                 "id": f["id"],
-                "ftp_mdtm": props.get("ftp_mdtm", ""),
-                "ftp_size": str(props.get("ftp_size") or f.get("size") or ""),
+                "sha256": saved_hash.lower(),
+                "ftp_sig": props.get("ftp_sig", ""),
             }
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -89,37 +90,51 @@ def get_existing_files(service, folder_id):
     return existing
 
 
-def get_ftp_file_signature(ftp_ref, ftp_path, item):
-    """Отримує точний час модифікації (MDTM) та розмір (SIZE) файлу на FTP"""
+def list_ftp_entries(ftp_ref, ftp_path):
+    """Швидко отримує весь вміст папки за 1 команду (імена, типи, дати та розміри)"""
     for attempt in range(1, 4):
         try:
             ftp_ref[0].cwd(ftp_path)
-            mdtm = ""
+            # Спроба сучасного швидкого MLSD
             try:
-                resp = ftp_ref[0].sendcmd(f"MDTM {item}")
-                if resp.startswith("213 "):
-                    mdtm = resp[4:].strip()
+                entries = []
+                for name, facts in ftp_ref[0].mlsd():
+                    if name in (".", ".."):
+                        continue
+                    etype = facts.get("type", "")
+                    is_dir = etype == "dir"
+                    sig = f"{facts.get('modify', '')}_{facts.get('size', '')}"
+                    entries.append((name, is_dir, sig))
+                return entries
             except Exception:
-                mdtm = ""
-
-            size = ""
-            try:
-                sz = ftp_ref[0].size(item)
-                if sz is not None:
-                    size = str(sz)
-            except Exception:
-                size = ""
-
-            return mdtm, size
+                # Резервний швидкий LIST за 1 запит на всю папку
+                lines = []
+                ftp_ref[0].retrlines("LIST", lines.append)
+                entries = []
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    name = parts[-1]
+                    if name in (".", ".."):
+                        continue
+                    is_dir = line.startswith("d") or "<DIR>" in line
+                    # Беремо розмір і дату з рядка LIST як швидку сигнатуру
+                    sig = "_".join(parts[:-1])
+                    entries.append((name, is_dir, sig))
+                return entries
+        except ftplib.error_perm as e:
+            print(f"Папка {ftp_path} ще не створена на FTP: {e}", flush=True)
+            return []
         except Exception as e:
-            print(f"Повтор перевірки метаданих {item} (спроба {attempt}/3): {e}", flush=True)
+            print(f"Повтор читання папки {ftp_path} (спроба {attempt}/3): {e}", flush=True)
             try:
                 ftp_ref[0].quit()
             except Exception:
                 pass
             time.sleep(2)
             ftp_ref[0] = connect_ftp()
-    return None, None
+    return []
 
 
 def download_from_ftp(ftp_ref, ftp_path, item):
@@ -143,73 +158,65 @@ def download_from_ftp(ftp_ref, ftp_path, item):
 
 def sync_directory(ftp_ref, ftp_path, drive, drive_folder_id, existing_files):
     changed_count = 0
-    try:
-        ftp_ref[0].cwd(ftp_path)
-    except ftplib.error_perm as e:
-        print(f"Папка {ftp_path} ще не створена на FTP: {e}", flush=True)
-        return 0
+    entries = list_ftp_entries(ftp_ref, ftp_path)
 
-    items = ftp_ref[0].nlst()
-    for item in items:
-        if item in (".", ".."):
-            continue
+    for item, is_dir, ftp_sig in entries:
         full_ftp_path = f"{ftp_path}/{item}" if ftp_path != "/" else f"/{item}"
-        try:
-            ftp_ref[0].cwd(full_ftp_path)
+        if is_dir:
             sub_folder_id = get_or_create_folder(drive, item, drive_folder_id)
             sub_existing = get_existing_files(drive, sub_folder_id)
             changed_count += sync_directory(ftp_ref, full_ftp_path, drive, sub_folder_id, sub_existing)
-            ftp_ref[0].cwd(ftp_path)
-        except ftplib.error_perm:
-            # 1. Фільтр: працюємо лише зі Storm, AVIA, HydrS та AADD
+        else:
             if not any(keyword in item.lower() for keyword in ALLOWED_FILES):
-                continue
-
-            # 2. Перевіряємо дату зміни та розмір файлу на FTP
-            ftp_mdtm, ftp_size = get_ftp_file_signature(ftp_ref, ftp_path, item)
-            if ftp_mdtm is None:
                 continue
 
             existing_info = existing_files.get(item)
 
-            # Якщо файл уже є на Диску — порівнюємо його сигнатуру з FTP
-            if existing_info:
-                same_mdtm = bool(ftp_mdtm) and (existing_info["ftp_mdtm"] == ftp_mdtm)
-                same_size = bool(ftp_size) and (existing_info["ftp_size"] == ftp_size)
+            # 1. Миттєва перевірка без завантаження: якщо сигнатура FTP не змінилася — пропускаємо
+            if existing_info and existing_info["ftp_sig"] == ftp_sig and ftp_sig != "":
+                continue
 
-                # Якщо і дата модифікації, і розмір не змінилися — залишаємо файл без змін
-                if same_mdtm and same_size:
-                    continue
-                # Якщо сервер не підтримує MDTM, перевіряємо хоча б розмір
-                if not ftp_mdtm and same_size:
-                    continue
-
-            # 3. Завантажуємо новий або оновлений файл із FTP
+            # 2. Завантажуємо тільки новий або змінений на FTP файл
             bio = download_from_ftp(ftp_ref, ftp_path, item)
             if bio is None:
                 print(f"Пропущено після 3 невдалих спроб FTP: {item}", flush=True)
                 continue
 
-            actual_size = str(bio.getbuffer().nbytes)
+            file_bytes = bio.getvalue()
+            current_sha256 = hashlib.sha256(file_bytes).hexdigest().lower()
+            bio.seek(0)
+
             app_props = {
-                "ftp_mdtm": ftp_mdtm,
-                "ftp_size": ftp_size or actual_size,
+                "content_sha256": current_sha256,
+                "ftp_sig": ftp_sig,
             }
+
+            # 3. Якщо на FTP оновилася дата, але вміст (SHA-256) лишився ідентичним —
+            # оновлюємо лише технічну мітку без перезапису самого файлу
+            if existing_info and existing_info["sha256"] == current_sha256:
+                try:
+                    drive.files().update(
+                        fileId=existing_info["id"],
+                        body={"appProperties": app_props},
+                        fields="id",
+                    ).execute(num_retries=5)
+                except Exception:
+                    pass
+                continue
+
             media = MediaIoBaseUpload(bio, mimetype="application/octet-stream", resumable=True)
 
             for attempt in range(1, 6):
                 try:
                     if existing_info:
-                        # Оновлюємо вміст існуючого файлу на Диску новішою версією
                         drive.files().update(
                             fileId=existing_info["id"],
                             body={"appProperties": app_props},
                             media_body=media,
                             fields="id",
                         ).execute(num_retries=5)
-                        print(f"Оновлено (нова версія): {full_ftp_path}", flush=True)
+                        print(f"Оновлено (змінився вміст): {full_ftp_path}", flush=True)
                     else:
-                        # Створюємо новий файл на Диску
                         file_metadata = {
                             "name": item,
                             "parents": [drive_folder_id],
@@ -220,8 +227,8 @@ def sync_directory(ftp_ref, ftp_path, drive, drive_folder_id, existing_files):
                         ).execute(num_retries=5)
                         existing_files[item] = {
                             "id": created["id"],
-                            "ftp_mdtm": ftp_mdtm,
-                            "ftp_size": ftp_size or actual_size,
+                            "sha256": current_sha256,
+                            "ftp_sig": ftp_sig,
                         }
                         print(f"Додано новий: {full_ftp_path}", flush=True)
 
@@ -238,7 +245,12 @@ def sync_directory(ftp_ref, ftp_path, drive, drive_folder_id, existing_files):
 
 def main():
     now = datetime.now(KYIV_TZ)
-    dates_to_check = [now - timedelta(days=1), now]
+    # Вчорашню папку перевіряємо лише в перші 2 години після опівночі, решту дня — тільки сьогоднішню
+    if now.hour < 2:
+        dates_to_check = [now - timedelta(days=1), now]
+    else:
+        dates_to_check = [now]
+
     print(f"Старт перевірки за {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     drive = get_drive_service()
