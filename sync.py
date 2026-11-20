@@ -1,9 +1,11 @@
 import os
 import io
+import re
 import hashlib
 import socket
 import ftplib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -18,7 +20,53 @@ ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 
 KYIV_TZ = timezone(timedelta(hours=2))
 
-ALLOWED_FILES = ("storm", "avia", "hydrs", "aadd")
+# Повні ключові слова (шукаються в будь-якій частині назви файлу)
+SUBSTRING_KEYWORDS = (
+    "aaxx",
+    "aadd",
+    "amdar",
+    "avia",
+    "base",
+    "diagn",
+    "eurdeperr",
+    "ffbb",
+    "grib",         # покриває і GRIB, і nogaps_GRIB2
+    "hhss",
+    "hhzz",
+    "hmore",
+    "hydrs",
+    "metar",
+    "prognoz",      # покриває і PROGNOZ, і PROGNOZ2
+    "radiation",
+    "sputn",        # покриває і Sputn, і Sputn_Evr_WatSteam
+    "storm",
+    "taf",
+    "ttaa",
+    "ttbb",
+    "ttcc",
+    "ttdd",
+    "nogaps_grib2",
+)
+
+# Короткі префікси (шукаються на початку назви файлу або після розділювача, щоб не хапати зайве)
+PREFIX_KEYWORDS = (
+    "an",
+    "pr",
+    "ua",
+    "u_",
+    "w_",
+)
+
+
+def is_target_file(filename):
+    name_low = filename.lower()
+    if any(kw in name_low for kw in SUBSTRING_KEYWORDS):
+        return True
+    # Перевіряємо короткі префікси на початку імені або після '_' / '-' / '.'
+    for pref in PREFIX_KEYWORDS:
+        if name_low.startswith(pref) or re.search(rf"(^|[_\-\.]){re.escape(pref)}", name_low):
+            return True
+    return False
 
 
 def connect_ftp():
@@ -61,7 +109,7 @@ def get_or_create_folder(service, name, parent_id):
 
 
 def get_existing_files(service, folder_id):
-    """Отримує список файлів на Диску разом із SHA-256 та збереженою FTP-сигнатурою"""
+    """Отримує список файлів на Google Диску з їхнім реальним SHA-256 хешем"""
     existing = {}
     page_token = None
     while True:
@@ -82,7 +130,6 @@ def get_existing_files(service, folder_id):
             existing[f["name"]] = {
                 "id": f["id"],
                 "sha256": saved_hash.lower(),
-                "ftp_sig": props.get("ftp_sig", ""),
             }
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -90,162 +137,74 @@ def get_existing_files(service, folder_id):
     return existing
 
 
-def list_ftp_entries(ftp_ref, ftp_path):
-    """Швидко отримує весь вміст папки за 1 команду (імена, типи, дати та розміри)"""
-    for attempt in range(1, 4):
-        try:
-            ftp_ref[0].cwd(ftp_path)
-            # Спроба сучасного швидкого MLSD
-            try:
-                entries = []
-                for name, facts in ftp_ref[0].mlsd():
-                    if name in (".", ".."):
-                        continue
-                    etype = facts.get("type", "")
-                    is_dir = etype == "dir"
-                    sig = f"{facts.get('modify', '')}_{facts.get('size', '')}"
-                    entries.append((name, is_dir, sig))
-                return entries
-            except Exception:
-                # Резервний швидкий LIST за 1 запит на всю папку
-                lines = []
-                ftp_ref[0].retrlines("LIST", lines.append)
-                entries = []
-                for line in lines:
-                    parts = line.split()
-                    if len(parts) < 4:
-                        continue
-                    name = parts[-1]
-                    if name in (".", ".."):
-                        continue
-                    is_dir = line.startswith("d") or "<DIR>" in line
-                    # Беремо розмір і дату з рядка LIST як швидку сигнатуру
-                    sig = "_".join(parts[:-1])
-                    entries.append((name, is_dir, sig))
-                return entries
-        except ftplib.error_perm as e:
-            print(f"Папка {ftp_path} ще не створена на FTP: {e}", flush=True)
-            return []
-        except Exception as e:
-            print(f"Повтор читання папки {ftp_path} (спроба {attempt}/3): {e}", flush=True)
-            try:
-                ftp_ref[0].quit()
-            except Exception:
-                pass
-            time.sleep(2)
-            ftp_ref[0] = connect_ftp()
-    return []
+def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
+    """Обходить дерево папок FTP та збирає список цільових файлів для перевірки"""
+    try:
+        ftp.cwd(ftp_path)
+    except ftplib.error_perm as e:
+        print(f"Папка {ftp_path} ще не створена на FTP: {e}", flush=True)
+        return
 
+    existing_files = get_existing_files(drive, drive_folder_id)
+    items = ftp.nlst()
 
-def download_from_ftp(ftp_ref, ftp_path, item):
-    for attempt in range(1, 4):
-        try:
-            ftp_ref[0].cwd(ftp_path)
-            bio = io.BytesIO()
-            ftp_ref[0].retrbinary(f"RETR {item}", bio.write)
-            bio.seek(0)
-            return bio
-        except Exception as e:
-            print(f"Повтор скачування {item} (спроба {attempt}/3): {e}", flush=True)
-            try:
-                ftp_ref[0].quit()
-            except Exception:
-                pass
-            time.sleep(2)
-            ftp_ref[0] = connect_ftp()
-    return None
-
-
-def sync_directory(ftp_ref, ftp_path, drive, drive_folder_id, existing_files):
-    changed_count = 0
-    entries = list_ftp_entries(ftp_ref, ftp_path)
-
-    for item, is_dir, ftp_sig in entries:
+    for item in items:
+        if item in (".", ".."):
+            continue
         full_ftp_path = f"{ftp_path}/{item}" if ftp_path != "/" else f"/{item}"
-        if is_dir:
+        try:
+            ftp.cwd(full_ftp_path)
             sub_folder_id = get_or_create_folder(drive, item, drive_folder_id)
-            sub_existing = get_existing_files(drive, sub_folder_id)
-            changed_count += sync_directory(ftp_ref, full_ftp_path, drive, sub_folder_id, sub_existing)
-        else:
-            if not any(keyword in item.lower() for keyword in ALLOWED_FILES):
-                continue
+            collect_ftp_tasks(ftp, full_ftp_path, drive, sub_folder_id, tasks)
+            ftp.cwd(ftp_path)
+        except ftplib.error_perm:
+            if is_target_file(item):
+                tasks.append({
+                    "ftp_path": ftp_path,
+                    "full_ftp_path": full_ftp_path,
+                    "name": item,
+                    "drive_folder_id": drive_folder_id,
+                    "existing_info": existing_files.get(item),
+                })
 
-            existing_info = existing_files.get(item)
 
-            # 1. Миттєва перевірка без завантаження: якщо сигнатура FTP не змінилася — пропускаємо
-            if existing_info and existing_info["ftp_sig"] == ftp_sig and ftp_sig != "":
-                continue
-
-            # 2. Завантажуємо тільки новий або змінений на FTP файл
-            bio = download_from_ftp(ftp_ref, ftp_path, item)
-            if bio is None:
-                print(f"Пропущено після 3 невдалих спроб FTP: {item}", flush=True)
-                continue
-
-            file_bytes = bio.getvalue()
-            current_sha256 = hashlib.sha256(file_bytes).hexdigest().lower()
-            bio.seek(0)
-
-            app_props = {
-                "content_sha256": current_sha256,
-                "ftp_sig": ftp_sig,
-            }
-
-            # 3. Якщо на FTP оновилася дата, але вміст (SHA-256) лишився ідентичним —
-            # оновлюємо лише технічну мітку без перезапису самого файлу
-            if existing_info and existing_info["sha256"] == current_sha256:
+def download_chunk(task_batch):
+    """Завантажує групу файлів в окремому потоці через власне FTP-з'єднання"""
+    results = []
+    ftp = None
+    try:
+        ftp = connect_ftp()
+        for task in task_batch:
+            for attempt in range(1, 4):
                 try:
-                    drive.files().update(
-                        fileId=existing_info["id"],
-                        body={"appProperties": app_props},
-                        fields="id",
-                    ).execute(num_retries=5)
-                except Exception:
-                    pass
-                continue
-
-            media = MediaIoBaseUpload(bio, mimetype="application/octet-stream", resumable=True)
-
-            for attempt in range(1, 6):
-                try:
-                    if existing_info:
-                        drive.files().update(
-                            fileId=existing_info["id"],
-                            body={"appProperties": app_props},
-                            media_body=media,
-                            fields="id",
-                        ).execute(num_retries=5)
-                        print(f"Оновлено (змінився вміст): {full_ftp_path}", flush=True)
-                    else:
-                        file_metadata = {
-                            "name": item,
-                            "parents": [drive_folder_id],
-                            "appProperties": app_props,
-                        }
-                        created = drive.files().create(
-                            body=file_metadata, media_body=media, fields="id"
-                        ).execute(num_retries=5)
-                        existing_files[item] = {
-                            "id": created["id"],
-                            "sha256": current_sha256,
-                            "ftp_sig": ftp_sig,
-                        }
-                        print(f"Додано новий: {full_ftp_path}", flush=True)
-
-                    changed_count += 1
+                    ftp.cwd(task["ftp_path"])
+                    bio = io.BytesIO()
+                    ftp.retrbinary(f"RETR {task['name']}", bio.write)
+                    file_bytes = bio.getvalue()
+                    current_sha256 = hashlib.sha256(file_bytes).hexdigest().lower()
+                    results.append((task, file_bytes, current_sha256))
                     break
-                except Exception as err:
-                    if attempt == 5:
-                        print(f"Помилка запису {item} на Диск: {err}", flush=True)
+                except Exception as e:
+                    if attempt == 3:
+                        print(f"Не вдалося завантажити {task['full_ftp_path']}: {e}", flush=True)
                     else:
-                        time.sleep(attempt * 3)
-
-    return changed_count
+                        try:
+                            ftp.quit()
+                        except Exception:
+                            pass
+                        time.sleep(1)
+                        ftp = connect_ftp()
+    finally:
+        if ftp:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+    return results
 
 
 def main():
     now = datetime.now(KYIV_TZ)
-    # Вчорашню папку перевіряємо лише в перші 2 години після опівночі, решту дня — тільки сьогоднішню
     if now.hour < 2:
         dates_to_check = [now - timedelta(days=1), now]
     else:
@@ -254,8 +213,8 @@ def main():
     print(f"Старт перевірки за {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     drive = get_drive_service()
-    ftp_ref = [connect_ftp()]
-    total_changed = 0
+    ftp = connect_ftp()
+    tasks = []
 
     try:
         for target_date in dates_to_check:
@@ -263,13 +222,63 @@ def main():
             day_folder = target_date.strftime("%d_%m")
             month_id = get_or_create_folder(drive, month_folder, ROOT_FOLDER_ID)
             day_id = get_or_create_folder(drive, day_folder, month_id)
-            existing_files = get_existing_files(drive, day_id)
-            total_changed += sync_directory(ftp_ref, f"/{day_folder}", drive, day_id, existing_files)
+            collect_ftp_tasks(ftp, f"/{day_folder}", drive, day_id, tasks)
     finally:
         try:
-            ftp_ref[0].quit()
+            ftp.quit()
         except Exception:
             pass
+
+    print(f"Знайдено цільових файлів для звірки: {len(tasks)}", flush=True)
+
+    num_workers = min(6, max(1, len(tasks)))
+    batches = [tasks[i::num_workers] for i in range(num_workers)] if tasks else []
+
+    downloaded_items = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(download_chunk, batch) for batch in batches]
+        for future in as_completed(futures):
+            downloaded_items.extend(future.result())
+
+    total_changed = 0
+    for task, file_bytes, current_sha256 in downloaded_items:
+        existing_info = task["existing_info"]
+
+        if existing_info and existing_info["sha256"] == current_sha256:
+            continue
+
+        bio = io.BytesIO(file_bytes)
+        media = MediaIoBaseUpload(bio, mimetype="application/octet-stream", resumable=True)
+        app_props = {"content_sha256": current_sha256}
+
+        for attempt in range(1, 6):
+            try:
+                if existing_info:
+                    drive.files().update(
+                        fileId=existing_info["id"],
+                        body={"appProperties": app_props},
+                        media_body=media,
+                        fields="id",
+                    ).execute(num_retries=5)
+                    print(f"Оновлено (змінився вміст): {task['full_ftp_path']}", flush=True)
+                else:
+                    file_metadata = {
+                        "name": task["name"],
+                        "parents": [task["drive_folder_id"]],
+                        "appProperties": app_props,
+                    }
+                    drive.files().create(
+                        body=file_metadata, media_body=media, fields="id"
+                    ).execute(num_retries=5)
+                    print(f"Додано новий: {task['full_ftp_path']}", flush=True)
+
+                total_changed += 1
+                break
+            except Exception as err:
+                if attempt == 5:
+                    print(f"Помилка запису {task['name']} на Диск: {err}", flush=True)
+                else:
+                    time.sleep(attempt * 3)
 
     print(f"Перевірку завершено. Додано або оновлено файлів: {total_changed}", flush=True)
 
