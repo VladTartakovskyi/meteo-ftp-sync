@@ -13,7 +13,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 socket.setdefaulttimeout(30)
 
-FTP_HOST = "ftp.meteo.gov.ua"
+FTP_HOSTS = ("ftp.meteo.gov.ua", "ftp1.meteo.gov.ua")
 FTP_USER = os.environ["FTP_USER"]
 FTP_PASS = os.environ["FTP_PASS"]
 ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
@@ -66,11 +66,25 @@ def is_target_file(filename):
     return False
 
 
-def connect_ftp():
-    ftp = ftplib.FTP(FTP_HOST, timeout=30)
+def connect_to_host(host, timeout=20):
+    ftp = ftplib.FTP(host, timeout=timeout)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.set_pasv(True)
     return ftp
+
+
+def get_working_ftp():
+    """Перевіряє основний FTP-сервер, а якщо він не працює — перемикається на резервний"""
+    last_error = None
+    for host in FTP_HOSTS:
+        try:
+            ftp = connect_to_host(host, timeout=15)
+            print(f"Підключено до FTP-сервера: {host}", flush=True)
+            return ftp, host
+        except Exception as e:
+            print(f"Сервер {host} недоступний ({e}), пробую наступний...", flush=True)
+            last_error = e
+    raise ConnectionError(f"Жоден із FTP-серверів не відповідає. Остання помилка: {last_error}")
 
 
 def get_drive_service():
@@ -161,7 +175,6 @@ def list_dir_fast(ftp, ftp_path):
             if name in (".", ".."):
                 continue
             is_dir = line.startswith("d") or "<DIR>" in line
-            # У Unix LIST розмір зазвичай у parts[4], у Windows — у parts[2]
             size = ""
             if not is_dir:
                 for token in (parts[4] if len(parts) > 4 else "", parts[2]):
@@ -192,7 +205,6 @@ def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
                 continue
 
             existing_info = existing_files.get(name)
-            # Якщо MLSD вже дав точний час і розмір, і вони збігаються — не додаємо навіть у чергу перевірки
             if (
                 existing_info
                 and mlsd_mtime
@@ -213,12 +225,12 @@ def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
             })
 
 
-def check_and_download_chunk(task_batch):
+def check_and_download_chunk(task_batch, active_host):
     """Перевіряє точну дату MDTM і завантажує файл ТІЛЬКИ якщо він новий або змінився"""
     results = []
     ftp = None
     try:
-        ftp = connect_ftp()
+        ftp = connect_to_host(active_host)
         current_cwd = ""
         for task in task_batch:
             for attempt in range(1, 4):
@@ -227,7 +239,6 @@ def check_and_download_chunk(task_batch):
                         ftp.cwd(task["ftp_path"])
                         current_cwd = task["ftp_path"]
 
-                    # Отримуємо точну секунду зміни файлу на сервері (команда MDTM)
                     ftp_mtime = task["mlsd_mtime"]
                     if not ftp_mtime:
                         try:
@@ -238,7 +249,6 @@ def check_and_download_chunk(task_batch):
                             ftp_mtime = ""
 
                     existing_info = task["existing_info"]
-                    # Якщо файл вже є на Диску, і збігаються І розмір, І точна дата MDTM — не скачуємо!
                     if (
                         existing_info
                         and ftp_mtime
@@ -247,7 +257,6 @@ def check_and_download_chunk(task_batch):
                     ):
                         break
 
-                    # Завантажуємо тільки новий або змінений файл
                     bio = io.BytesIO()
                     ftp.retrbinary(f"RETR {task['name']}", bio.write)
                     file_bytes = bio.getvalue()
@@ -264,7 +273,7 @@ def check_and_download_chunk(task_batch):
                         except Exception:
                             pass
                         time.sleep(1)
-                        ftp = connect_ftp()
+                        ftp = connect_to_host(active_host)
     finally:
         if ftp:
             try:
@@ -284,7 +293,7 @@ def main():
     print(f"Старт перевірки за {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     drive = get_drive_service()
-    ftp = connect_ftp()
+    ftp, active_host = get_working_ftp()
     tasks = []
 
     try:
@@ -307,7 +316,10 @@ def main():
 
     downloaded_items = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(check_and_download_chunk, batch) for batch in batches]
+        futures = [
+            executor.submit(check_and_download_chunk, batch, active_host)
+            for batch in batches
+        ]
         for future in as_completed(futures):
             downloaded_items.extend(future.result())
 
@@ -315,7 +327,6 @@ def main():
     for task, file_bytes, current_sha256, ftp_mtime in downloaded_items:
         existing_info = task["existing_info"]
 
-        # Якщо вміст SHA-256 не змінився — не чіпаємо файл на Диску (щоб зберегти дату змінення)
         if existing_info and existing_info["sha256"] == current_sha256:
             continue
 
@@ -355,7 +366,7 @@ def main():
                 else:
                     time.sleep(attempt * 3)
 
-    print(f"Перевірку завершено. Додано або оновлено файлів: {total_changed}", flush=True)
+    print(f"Перевірку завершено ({active_host}). Додано або оновлено файлів: {total_changed}", flush=True)
 
 
 if __name__ == "__main__":
