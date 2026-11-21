@@ -20,7 +20,6 @@ ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 
 KYIV_TZ = timezone(timedelta(hours=2))
 
-# Повні ключові слова (шукаються в будь-якій частині назви файлу)
 SUBSTRING_KEYWORDS = (
     "aaxx",
     "aadd",
@@ -30,15 +29,15 @@ SUBSTRING_KEYWORDS = (
     "diagn",
     "eurdeperr",
     "ffbb",
-    "grib",         # покриває і GRIB, і nogaps_GRIB2
+    "grib",
     "hhss",
     "hhzz",
     "hmore",
     "hydrs",
     "metar",
-    "prognoz",      # покриває і PROGNOZ, і PROGNOZ2
+    "prognoz",
     "radiation",
-    "sputn",        # покриває і Sputn, і Sputn_Evr_WatSteam
+    "sputn",
     "storm",
     "taf",
     "ttaa",
@@ -48,7 +47,6 @@ SUBSTRING_KEYWORDS = (
     "nogaps_grib2",
 )
 
-# Короткі префікси (шукаються на початку назви файлу або після розділювача, щоб не хапати зайве)
 PREFIX_KEYWORDS = (
     "an",
     "pr",
@@ -62,7 +60,6 @@ def is_target_file(filename):
     name_low = filename.lower()
     if any(kw in name_low for kw in SUBSTRING_KEYWORDS):
         return True
-    # Перевіряємо короткі префікси на початку імені або після '_' / '-' / '.'
     for pref in PREFIX_KEYWORDS:
         if name_low.startswith(pref) or re.search(rf"(^|[_\-\.]){re.escape(pref)}", name_low):
             return True
@@ -109,7 +106,7 @@ def get_or_create_folder(service, name, parent_id):
 
 
 def get_existing_files(service, folder_id):
-    """Отримує список файлів на Google Диску з їхнім реальним SHA-256 хешем"""
+    """Отримує список файлів на Google Диску з їхнім SHA-256 та збереженою FTP-міткою"""
     existing = {}
     page_token = None
     while True:
@@ -118,7 +115,7 @@ def get_existing_files(service, folder_id):
             service.files()
             .list(
                 q=query,
-                fields="nextPageToken, files(id, name, sha256Checksum, appProperties)",
+                fields="nextPageToken, files(id, name, size, sha256Checksum, appProperties)",
                 pageSize=1000,
                 pageToken=page_token,
             )
@@ -129,7 +126,9 @@ def get_existing_files(service, folder_id):
             saved_hash = f.get("sha256Checksum") or props.get("content_sha256", "")
             existing[f["name"]] = {
                 "id": f["id"],
+                "size": str(f.get("size", "")),
                 "sha256": saved_hash.lower(),
+                "ftp_mtime": props.get("ftp_mtime", ""),
             }
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -137,56 +136,128 @@ def get_existing_files(service, folder_id):
     return existing
 
 
-def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
-    """Обходить дерево папок FTP та збирає список цільових файлів для перевірки"""
+def list_dir_fast(ftp, ftp_path):
+    """Отримує список папок і файлів за 1 команду FTP без зайвих cwd для кожного файлу"""
+    ftp.cwd(ftp_path)
     try:
-        ftp.cwd(ftp_path)
+        entries = []
+        for name, facts in ftp.mlsd():
+            if name in (".", ".."):
+                continue
+            is_dir = facts.get("type") == "dir"
+            size = str(facts.get("size", ""))
+            mtime = str(facts.get("modify", ""))
+            entries.append((name, is_dir, size, mtime))
+        return entries
+    except Exception:
+        lines = []
+        ftp.retrlines("LIST", lines.append)
+        entries = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name = parts[-1]
+            if name in (".", ".."):
+                continue
+            is_dir = line.startswith("d") or "<DIR>" in line
+            # У Unix LIST розмір зазвичай у parts[4], у Windows — у parts[2]
+            size = ""
+            if not is_dir:
+                for token in (parts[4] if len(parts) > 4 else "", parts[2]):
+                    if token.isdigit():
+                        size = token
+                        break
+            entries.append((name, is_dir, size, ""))
+        return entries
+
+
+def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
+    """Швидко обходить папки FTP та відбирає тільки нові або потенційно змінені файли"""
+    try:
+        entries = list_dir_fast(ftp, ftp_path)
     except ftplib.error_perm as e:
         print(f"Папка {ftp_path} ще не створена на FTP: {e}", flush=True)
         return
 
     existing_files = get_existing_files(drive, drive_folder_id)
-    items = ftp.nlst()
 
-    for item in items:
-        if item in (".", ".."):
-            continue
-        full_ftp_path = f"{ftp_path}/{item}" if ftp_path != "/" else f"/{item}"
-        try:
-            ftp.cwd(full_ftp_path)
-            sub_folder_id = get_or_create_folder(drive, item, drive_folder_id)
+    for name, is_dir, ftp_size, mlsd_mtime in entries:
+        full_ftp_path = f"{ftp_path}/{name}" if ftp_path != "/" else f"/{name}"
+        if is_dir:
+            sub_folder_id = get_or_create_folder(drive, name, drive_folder_id)
             collect_ftp_tasks(ftp, full_ftp_path, drive, sub_folder_id, tasks)
-            ftp.cwd(ftp_path)
-        except ftplib.error_perm:
-            if is_target_file(item):
-                tasks.append({
-                    "ftp_path": ftp_path,
-                    "full_ftp_path": full_ftp_path,
-                    "name": item,
-                    "drive_folder_id": drive_folder_id,
-                    "existing_info": existing_files.get(item),
-                })
+        else:
+            if not is_target_file(name):
+                continue
+
+            existing_info = existing_files.get(name)
+            # Якщо MLSD вже дав точний час і розмір, і вони збігаються — не додаємо навіть у чергу перевірки
+            if (
+                existing_info
+                and mlsd_mtime
+                and existing_info["ftp_mtime"] == mlsd_mtime
+                and ftp_size
+                and existing_info["size"] == ftp_size
+            ):
+                continue
+
+            tasks.append({
+                "ftp_path": ftp_path,
+                "full_ftp_path": full_ftp_path,
+                "name": name,
+                "ftp_size": ftp_size,
+                "mlsd_mtime": mlsd_mtime,
+                "drive_folder_id": drive_folder_id,
+                "existing_info": existing_info,
+            })
 
 
-def download_chunk(task_batch):
-    """Завантажує групу файлів в окремому потоці через власне FTP-з'єднання"""
+def check_and_download_chunk(task_batch):
+    """Перевіряє точну дату MDTM і завантажує файл ТІЛЬКИ якщо він новий або змінився"""
     results = []
     ftp = None
     try:
         ftp = connect_ftp()
+        current_cwd = ""
         for task in task_batch:
             for attempt in range(1, 4):
                 try:
-                    ftp.cwd(task["ftp_path"])
+                    if current_cwd != task["ftp_path"]:
+                        ftp.cwd(task["ftp_path"])
+                        current_cwd = task["ftp_path"]
+
+                    # Отримуємо точну секунду зміни файлу на сервері (команда MDTM)
+                    ftp_mtime = task["mlsd_mtime"]
+                    if not ftp_mtime:
+                        try:
+                            resp = ftp.sendcmd(f"MDTM {task['name']}")
+                            if resp.startswith("213 "):
+                                ftp_mtime = resp.split()[1].strip()
+                        except Exception:
+                            ftp_mtime = ""
+
+                    existing_info = task["existing_info"]
+                    # Якщо файл вже є на Диску, і збігаються І розмір, І точна дата MDTM — не скачуємо!
+                    if (
+                        existing_info
+                        and ftp_mtime
+                        and existing_info["ftp_mtime"] == ftp_mtime
+                        and (not task["ftp_size"] or existing_info["size"] == task["ftp_size"])
+                    ):
+                        break
+
+                    # Завантажуємо тільки новий або змінений файл
                     bio = io.BytesIO()
                     ftp.retrbinary(f"RETR {task['name']}", bio.write)
                     file_bytes = bio.getvalue()
                     current_sha256 = hashlib.sha256(file_bytes).hexdigest().lower()
-                    results.append((task, file_bytes, current_sha256))
+                    results.append((task, file_bytes, current_sha256, ftp_mtime))
                     break
                 except Exception as e:
+                    current_cwd = ""
                     if attempt == 3:
-                        print(f"Не вдалося завантажити {task['full_ftp_path']}: {e}", flush=True)
+                        print(f"Не вдалося обробити {task['full_ftp_path']}: {e}", flush=True)
                     else:
                         try:
                             ftp.quit()
@@ -229,27 +300,31 @@ def main():
         except Exception:
             pass
 
-    print(f"Знайдено цільових файлів для звірки: {len(tasks)}", flush=True)
+    print(f"Кандидатів на перевірку: {len(tasks)}", flush=True)
 
-    num_workers = min(6, max(1, len(tasks)))
+    num_workers = min(8, max(1, len(tasks)))
     batches = [tasks[i::num_workers] for i in range(num_workers)] if tasks else []
 
     downloaded_items = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(download_chunk, batch) for batch in batches]
+        futures = [executor.submit(check_and_download_chunk, batch) for batch in batches]
         for future in as_completed(futures):
             downloaded_items.extend(future.result())
 
     total_changed = 0
-    for task, file_bytes, current_sha256 in downloaded_items:
+    for task, file_bytes, current_sha256, ftp_mtime in downloaded_items:
         existing_info = task["existing_info"]
 
+        # Якщо вміст SHA-256 не змінився — не чіпаємо файл на Диску (щоб зберегти дату змінення)
         if existing_info and existing_info["sha256"] == current_sha256:
             continue
 
         bio = io.BytesIO(file_bytes)
         media = MediaIoBaseUpload(bio, mimetype="application/octet-stream", resumable=True)
-        app_props = {"content_sha256": current_sha256}
+        app_props = {
+            "content_sha256": current_sha256,
+            "ftp_mtime": ftp_mtime,
+        }
 
         for attempt in range(1, 6):
             try:
