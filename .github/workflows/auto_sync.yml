@@ -24,11 +24,10 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Запуск синхронізації
-        env:
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
-          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
-          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: python sync.py
+     env:
+       FTP_SHEET_ID: ${{ secrets.FTP_SHEET_ID }}
+       GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+       GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+       GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+     run: python sync.py
