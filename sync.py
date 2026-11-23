@@ -20,8 +20,19 @@ ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 KYIV_TZ = timezone(timedelta(hours=2))
 
 
-def is_target_file(filename, target_prefixes):
-    """Перевіряє, чи починається назва файлу з будь-якого префікса зі стовпчика J"""
+def is_truthy(cell_value):
+    """Перевіряє, чи встановлено TRUE у клітинці (прапорець або спадний список)"""
+    if isinstance(cell_value, bool):
+        return cell_value
+    if cell_value is None:
+        return False
+    return str(cell_value).strip().upper() == "TRUE"
+
+
+def is_target_file(filename, download_all, target_prefixes):
+    """Перевіряє, чи підходить файл під правила зі стовпчиків H та I"""
+    if download_all:
+        return True
     name_low = filename.lower()
     return name_low.startswith(target_prefixes)
 
@@ -47,7 +58,7 @@ def clean_ftp_host(raw_value):
 
 
 def get_sheet_settings(drive):
-    """Зчитує налаштування FTP (C2:E3) та список префіксів файлів зі стовпчика J (починаючи з J2)"""
+    """Зчитує налаштування FTP (C2:E3) та правила фільтрації зі стовпчиків H та I (від 2-го рядка)"""
     xlsx_bytes = (
         drive.files()
         .export(
@@ -82,21 +93,37 @@ def get_sheet_settings(drive):
     if not configs:
         raise ValueError("У клітинках C2:E2 та C3:E3 відсутні коректні дані для підключення до FTP")
 
-    # Зчитуємо стовпчик J, пропускаючи 1-й рядок (заголовок) — від J2 до кінця
+    # Зчитуємо стовпчик H (назви/префікси) та стовпчик I (TRUE/FALSE), починаючи з 2-го рядка
+    download_all = False
     prefixes = []
+
     for row_idx in range(2, sheet.max_row + 1):
-        raw_val = sheet[f"J{row_idx}"].value
-        if raw_val is None:
+        raw_pattern = sheet[f"H{row_idx}"].value
+        raw_flag = sheet[f"I{row_idx}"].value
+
+        if raw_pattern is None:
             continue
-        val_low = str(raw_val).strip().lower()
-        if val_low and val_low not in prefixes:
-            prefixes.append(val_low)
 
-    if not prefixes:
-        raise ValueError("У стовпчику J (починаючи з J2) аркуша FTP не знайдено жодного префікса")
+        pattern = str(raw_pattern).strip()
+        if not pattern:
+            continue
 
-    print(f"Зчитано префіксів зі стовпчика J: {len(prefixes)}", flush=True)
-    return configs, tuple(prefixes)
+        if not is_truthy(raw_flag):
+            continue
+
+        if pattern in ("*.*", "*"):
+            download_all = True
+        else:
+            pat_low = pattern.lower()
+            if pat_low not in prefixes:
+                prefixes.append(pat_low)
+
+    if download_all:
+        print("Режим фільтрації: завантажуються УСІ файли (*.* = TRUE)", flush=True)
+    else:
+        print(f"Режим фільтрації за префіксами зі стовпчика H (активних TRUE: {len(prefixes)}): {prefixes}", flush=True)
+
+    return configs, download_all, tuple(prefixes)
 
 
 def connect_to_ftp(cfg, timeout=20):
@@ -206,7 +233,7 @@ def list_dir_fast(ftp, ftp_path):
         return entries
 
 
-def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, target_prefixes, tasks):
+def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, download_all, target_prefixes, tasks):
     """Швидко обходить папки FTP та відбирає тільки нові або потенційно змінені файли"""
     try:
         entries = list_dir_fast(ftp, ftp_path)
@@ -220,9 +247,9 @@ def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, target_prefixes, ta
         full_ftp_path = f"{ftp_path}/{name}" if ftp_path != "/" else f"/{name}"
         if is_dir:
             sub_folder_id = get_or_create_folder(drive, name, drive_folder_id)
-            collect_ftp_tasks(ftp, full_ftp_path, drive, sub_folder_id, target_prefixes, tasks)
+            collect_ftp_tasks(ftp, full_ftp_path, drive, sub_folder_id, download_all, target_prefixes, tasks)
         else:
-            if not is_target_file(name, target_prefixes):
+            if not is_target_file(name, download_all, target_prefixes):
                 continue
 
             existing_info = existing_files.get(name)
@@ -314,7 +341,12 @@ def main():
     print(f"Старт перевірки за {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     drive = get_drive_service()
-    ftp_configs, target_prefixes = get_sheet_settings(drive)
+    ftp_configs, download_all, target_prefixes = get_sheet_settings(drive)
+
+    if not download_all and not target_prefixes:
+        print("У стовпчику I немає жодного активного правила (TRUE). Перевірку завершено.", flush=True)
+        return
+
     ftp, active_cfg = get_working_ftp(ftp_configs)
     tasks = []
 
@@ -324,7 +356,7 @@ def main():
             day_folder = target_date.strftime("%d_%m")
             month_id = get_or_create_folder(drive, month_folder, ROOT_FOLDER_ID)
             day_id = get_or_create_folder(drive, day_folder, month_id)
-            collect_ftp_tasks(ftp, f"/{day_folder}", drive, day_id, target_prefixes, tasks)
+            collect_ftp_tasks(ftp, f"/{day_folder}", drive, day_id, download_all, target_prefixes, tasks)
     finally:
         try:
             ftp.quit()
