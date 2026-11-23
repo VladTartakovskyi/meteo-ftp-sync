@@ -19,50 +19,11 @@ ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 
 KYIV_TZ = timezone(timedelta(hours=2))
 
-SUBSTRING_KEYWORDS = (
-    "aaxx",
-    "aadd",
-    "amdar",
-    "avia",
-    "base",
-    "diagn",
-    "eurdeperr",
-    "ffbb",
-    "grib",
-    "hhss",
-    "hhzz",
-    "hmore",
-    "hydrs",
-    "metar",
-    "prognoz",
-    "radiation",
-    "sputn",
-    "storm",
-    "taf",
-    "ttaa",
-    "ttbb",
-    "ttcc",
-    "ttdd",
-    "nogaps_grib2",
-)
 
-PREFIX_KEYWORDS = (
-    "an",
-    "pr",
-    "ua",
-    "u_",
-    "w_",
-)
-
-
-def is_target_file(filename):
+def is_target_file(filename, target_prefixes):
+    """Перевіряє, чи починається назва файлу з будь-якого префікса зі стовпчика J"""
     name_low = filename.lower()
-    if any(kw in name_low for kw in SUBSTRING_KEYWORDS):
-        return True
-    for pref in PREFIX_KEYWORDS:
-        if name_low.startswith(pref) or re.search(rf"(^|[_\-\.]){re.escape(pref)}", name_low):
-            return True
-    return False
+    return name_low.startswith(target_prefixes)
 
 
 def get_drive_service():
@@ -85,8 +46,8 @@ def clean_ftp_host(raw_value):
     return val
 
 
-def get_ftp_configs(drive):
-    """Зчитує налаштування основного (рядок 2) та резервного (рядок 3) FTP з 3-го аркуша"""
+def get_sheet_settings(drive):
+    """Зчитує налаштування FTP (C2:E3) та список префіксів файлів зі стовпчика J (починаючи з J2)"""
     xlsx_bytes = (
         drive.files()
         .export(
@@ -97,7 +58,6 @@ def get_ftp_configs(drive):
     )
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
 
-    # Шукаємо аркуш за назвою 'FTP', або беремо 3-й по порядку (індекс 2)
     if "FTP" in wb.sheetnames:
         sheet = wb["FTP"]
     elif len(wb.worksheets) >= 3:
@@ -122,7 +82,21 @@ def get_ftp_configs(drive):
     if not configs:
         raise ValueError("У клітинках C2:E2 та C3:E3 відсутні коректні дані для підключення до FTP")
 
-    return configs
+    # Зчитуємо стовпчик J, пропускаючи 1-й рядок (заголовок) — від J2 до кінця
+    prefixes = []
+    for row_idx in range(2, sheet.max_row + 1):
+        raw_val = sheet[f"J{row_idx}"].value
+        if raw_val is None:
+            continue
+        val_low = str(raw_val).strip().lower()
+        if val_low and val_low not in prefixes:
+            prefixes.append(val_low)
+
+    if not prefixes:
+        raise ValueError("У стовпчику J (починаючи з J2) аркуша FTP не знайдено жодного префікса")
+
+    print(f"Зчитано префіксів зі стовпчика J: {len(prefixes)}", flush=True)
+    return configs, tuple(prefixes)
 
 
 def connect_to_ftp(cfg, timeout=20):
@@ -232,7 +206,7 @@ def list_dir_fast(ftp, ftp_path):
         return entries
 
 
-def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
+def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, target_prefixes, tasks):
     """Швидко обходить папки FTP та відбирає тільки нові або потенційно змінені файли"""
     try:
         entries = list_dir_fast(ftp, ftp_path)
@@ -246,9 +220,9 @@ def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
         full_ftp_path = f"{ftp_path}/{name}" if ftp_path != "/" else f"/{name}"
         if is_dir:
             sub_folder_id = get_or_create_folder(drive, name, drive_folder_id)
-            collect_ftp_tasks(ftp, full_ftp_path, drive, sub_folder_id, tasks)
+            collect_ftp_tasks(ftp, full_ftp_path, drive, sub_folder_id, target_prefixes, tasks)
         else:
-            if not is_target_file(name):
+            if not is_target_file(name, target_prefixes):
                 continue
 
             existing_info = existing_files.get(name)
@@ -340,7 +314,7 @@ def main():
     print(f"Старт перевірки за {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     drive = get_drive_service()
-    ftp_configs = get_ftp_configs(drive)
+    ftp_configs, target_prefixes = get_sheet_settings(drive)
     ftp, active_cfg = get_working_ftp(ftp_configs)
     tasks = []
 
@@ -350,7 +324,7 @@ def main():
             day_folder = target_date.strftime("%d_%m")
             month_id = get_or_create_folder(drive, month_folder, ROOT_FOLDER_ID)
             day_id = get_or_create_folder(drive, day_folder, month_id)
-            collect_ftp_tasks(ftp, f"/{day_folder}", drive, day_id, tasks)
+            collect_ftp_tasks(ftp, f"/{day_folder}", drive, day_id, target_prefixes, tasks)
     finally:
         try:
             ftp.quit()
