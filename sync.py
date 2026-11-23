@@ -5,6 +5,7 @@ import hashlib
 import socket
 import ftplib
 import time
+import openpyxl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from google.oauth2.credentials import Credentials
@@ -13,9 +14,7 @@ from googleapiclient.http import MediaIoBaseUpload
 
 socket.setdefaulttimeout(30)
 
-FTP_HOSTS = ("ftp.meteo.gov.ua", "ftp1.meteo.gov.ua")
-FTP_USER = os.environ["FTP_USER"]
-FTP_PASS = os.environ["FTP_PASS"]
+FTP_SHEET_ID = os.environ["FTP_SHEET_ID"]
 ROOT_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 
 KYIV_TZ = timezone(timedelta(hours=2))
@@ -66,27 +65,6 @@ def is_target_file(filename):
     return False
 
 
-def connect_to_host(host, timeout=20):
-    ftp = ftplib.FTP(host, timeout=timeout)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.set_pasv(True)
-    return ftp
-
-
-def get_working_ftp():
-    """Перевіряє основний FTP-сервер, а якщо він не працює — перемикається на резервний"""
-    last_error = None
-    for host in FTP_HOSTS:
-        try:
-            ftp = connect_to_host(host, timeout=15)
-            print(f"Підключено до FTP-сервера: {host}", flush=True)
-            return ftp, host
-        except Exception as e:
-            print(f"Сервер {host} недоступний ({e}), пробую наступний...", flush=True)
-            last_error = e
-    raise ConnectionError(f"Жоден із FTP-серверів не відповідає. Остання помилка: {last_error}")
-
-
 def get_drive_service():
     creds = Credentials(
         token=None,
@@ -97,6 +75,75 @@ def get_drive_service():
         scopes=["https://www.googleapis.com/auth/drive"],
     )
     return build("drive", "v3", credentials=creds)
+
+
+def clean_ftp_host(raw_value):
+    """Очищає посилання виду 'ftp://ftp.meteo.gov.ua/' до чистого хоста 'ftp.meteo.gov.ua'"""
+    val = str(raw_value or "").strip()
+    val = re.sub(r"^ftps?://", "", val, flags=re.IGNORECASE)
+    val = val.split("/")[0].strip()
+    return val
+
+
+def get_ftp_configs(drive):
+    """Зчитує налаштування основного (рядок 2) та резервного (рядок 3) FTP з 3-го аркуша"""
+    xlsx_bytes = (
+        drive.files()
+        .export(
+            fileId=FTP_SHEET_ID,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .execute(num_retries=5)
+    )
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+
+    # Шукаємо аркуш за назвою 'FTP', або беремо 3-й по порядку (індекс 2)
+    if "FTP" in wb.sheetnames:
+        sheet = wb["FTP"]
+    elif len(wb.worksheets) >= 3:
+        sheet = wb.worksheets[2]
+    else:
+        raise ValueError("У Google Таблиці не знайдено аркуш 'FTP' або 3-й аркуш")
+
+    configs = []
+    for row_idx, label in ((2, "основний"), (3, "резервний")):
+        host = clean_ftp_host(sheet[f"C{row_idx}"].value)
+        user = str(sheet[f"D{row_idx}"].value or "").strip()
+        password = str(sheet[f"E{row_idx}"].value or "").strip()
+
+        if host and user and password:
+            configs.append({
+                "label": label,
+                "host": host,
+                "user": user,
+                "pass": password,
+            })
+
+    if not configs:
+        raise ValueError("У клітинках C2:E2 та C3:E3 відсутні коректні дані для підключення до FTP")
+
+    return configs
+
+
+def connect_to_ftp(cfg, timeout=20):
+    ftp = ftplib.FTP(cfg["host"], timeout=timeout)
+    ftp.login(cfg["user"], cfg["pass"])
+    ftp.set_pasv(True)
+    return ftp
+
+
+def get_working_ftp(ftp_configs):
+    """Перевіряє основний FTP-сервер, а якщо він не працює — перемикається на резервний"""
+    last_error = None
+    for cfg in ftp_configs:
+        try:
+            ftp = connect_to_ftp(cfg, timeout=15)
+            print(f"Підключено до FTP ({cfg['label']}): {cfg['host']}", flush=True)
+            return ftp, cfg
+        except Exception as e:
+            print(f"Сервер {cfg['host']} ({cfg['label']}) недоступний ({e}), пробую наступний...", flush=True)
+            last_error = e
+    raise ConnectionError(f"Жоден із FTP-серверів не відповідає. Остання помилка: {last_error}")
 
 
 def get_or_create_folder(service, name, parent_id):
@@ -225,12 +272,12 @@ def collect_ftp_tasks(ftp, ftp_path, drive, drive_folder_id, tasks):
             })
 
 
-def check_and_download_chunk(task_batch, active_host):
+def check_and_download_chunk(task_batch, active_cfg):
     """Перевіряє точну дату MDTM і завантажує файл ТІЛЬКИ якщо він новий або змінився"""
     results = []
     ftp = None
     try:
-        ftp = connect_to_host(active_host)
+        ftp = connect_to_ftp(active_cfg)
         current_cwd = ""
         for task in task_batch:
             for attempt in range(1, 4):
@@ -273,7 +320,7 @@ def check_and_download_chunk(task_batch, active_host):
                         except Exception:
                             pass
                         time.sleep(1)
-                        ftp = connect_to_host(active_host)
+                        ftp = connect_to_ftp(active_cfg)
     finally:
         if ftp:
             try:
@@ -293,7 +340,8 @@ def main():
     print(f"Старт перевірки за {now.strftime('%Y-%m-%d %H:%M')}", flush=True)
 
     drive = get_drive_service()
-    ftp, active_host = get_working_ftp()
+    ftp_configs = get_ftp_configs(drive)
+    ftp, active_cfg = get_working_ftp(ftp_configs)
     tasks = []
 
     try:
@@ -317,7 +365,7 @@ def main():
     downloaded_items = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [
-            executor.submit(check_and_download_chunk, batch, active_host)
+            executor.submit(check_and_download_chunk, batch, active_cfg)
             for batch in batches
         ]
         for future in as_completed(futures):
@@ -366,7 +414,7 @@ def main():
                 else:
                     time.sleep(attempt * 3)
 
-    print(f"Перевірку завершено ({active_host}). Додано або оновлено файлів: {total_changed}", flush=True)
+    print(f"Перевірку завершено ({active_cfg['host']}). Додано або оновлено файлів: {total_changed}", flush=True)
 
 
 if __name__ == "__main__":
