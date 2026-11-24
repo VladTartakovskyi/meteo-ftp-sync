@@ -103,7 +103,7 @@ def clean_ftp_host(raw_value):
 
 
 def get_sheet_settings(drive):
-    """Зчитує налаштування FTP (C2:E3) та правила фільтрації зі стовпчиків H та I (від 2-го рядка)"""
+    """Зчитує всі FTP-сервери зі стовпчиків C:E (від 2-го рядка вниз) та правила фільтрації з H:I"""
     xlsx_bytes = (
         drive.files()
         .export(
@@ -122,12 +122,20 @@ def get_sheet_settings(drive):
         raise ValueError("У Google Таблиці не знайдено аркуш 'FTP' або 3-й аркуш")
 
     configs = []
-    for row_idx, label in ((2, "основний"), (3, "резервний")):
+    for row_idx in range(2, sheet.max_row + 1):
         host = clean_ftp_host(sheet[f"C{row_idx}"].value)
         user = str(sheet[f"D{row_idx}"].value or "").strip()
         password = str(sheet[f"E{row_idx}"].value or "").strip()
 
         if host and user and password:
+            server_num = len(configs) + 1
+            if server_num == 1:
+                label = "сервер №1 - основний"
+            elif server_num == 2:
+                label = "сервер №2 - резервний"
+            else:
+                label = f"сервер №{server_num}"
+
             configs.append({
                 "label": label,
                 "host": host,
@@ -136,7 +144,9 @@ def get_sheet_settings(drive):
             })
 
     if not configs:
-        raise ValueError("У клітинках C2:E2 та C3:E3 відсутні коректні дані для підключення до FTP")
+        raise ValueError("У стовпчиках C:E (починаючи з 2-го рядка) відсутні коректні дані для підключення до FTP")
+
+    print(f"Знайдено FTP-серверів у таблиці: {len(configs)} ({', '.join(c['host'] for c in configs)})", flush=True)
 
     download_all = False
     prefixes = []
@@ -179,7 +189,7 @@ def connect_to_ftp(cfg, timeout=20):
 
 
 def get_working_ftp(ftp_configs, max_rounds=3, retry_delay=5):
-    """Перевіряє FTP-сервери з повторними спробами; при збої DNS підключається по прямому IP через 8.8.8.8/1.1.1.1"""
+    """Послідовно перевіряє всі FTP-сервери з таблиці; при збої DNS підключається по прямому IP через 8.8.8.8/1.1.1.1"""
     last_error = None
     for round_num in range(1, max_rounds + 1):
         for cfg in ftp_configs:
@@ -213,7 +223,7 @@ def get_working_ftp(ftp_configs, max_rounds=3, retry_delay=5):
         if round_num < max_rounds:
             time.sleep(retry_delay)
 
-    raise ConnectionError(f"Жоден із FTP-серверів не відповідає після {max_rounds} спроб. Остання помилка: {last_error}")
+    raise ConnectionError(f"Жоден із {len(ftp_configs)} FTP-серверів не відповідає після {max_rounds} спроб. Остання помилка: {last_error}")
 
 
 def get_or_create_folder(service, name, parent_id):
