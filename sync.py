@@ -91,7 +91,7 @@ def get_drive_service():
         client_secret=os.environ["GDRIVE_CLIENT_SECRET"],
         scopes=["https://www.googleapis.com/auth/drive"],
     )
-    return build("drive", "v3", credentials=creds)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def clean_ftp_host(raw_value):
@@ -388,6 +388,10 @@ def check_and_download_chunk(task_batch, active_cfg):
                     ftp.retrbinary(f"RETR {task['name']}", bio.write)
                     file_bytes = bio.getvalue()
                     current_sha256 = hashlib.sha256(file_bytes).hexdigest().lower()
+
+                    if existing_info and existing_info["sha256"] == current_sha256:
+                        break
+
                     results.append((task, file_bytes, current_sha256, ftp_mtime))
                     break
                 except Exception as e:
@@ -410,7 +414,57 @@ def check_and_download_chunk(task_batch, active_cfg):
     return results
 
 
+def upload_drive_chunk(items_batch):
+    """Завантажує пакет файлів на Google Диск у власному потоці (1 HTTP-запит для файлів < 5 МБ)"""
+    drive = get_drive_service()
+    uploaded_count = 0
+
+    for task, file_bytes, current_sha256, ftp_mtime in items_batch:
+        existing_info = task["existing_info"]
+        use_resumable = len(file_bytes) > 5 * 1024 * 1024
+        app_props = {
+            "content_sha256": current_sha256,
+            "ftp_mtime": ftp_mtime,
+        }
+
+        for attempt in range(1, 6):
+            try:
+                bio = io.BytesIO(file_bytes)
+                media = MediaIoBaseUpload(
+                    bio, mimetype="application/octet-stream", resumable=use_resumable
+                )
+                if existing_info:
+                    drive.files().update(
+                        fileId=existing_info["id"],
+                        body={"appProperties": app_props},
+                        media_body=media,
+                        fields="id",
+                    ).execute(num_retries=3)
+                    print(f"Оновлено (змінився вміст): {task['full_ftp_path']}", flush=True)
+                else:
+                    file_metadata = {
+                        "name": task["name"],
+                        "parents": [task["drive_folder_id"]],
+                        "appProperties": app_props,
+                    }
+                    drive.files().create(
+                        body=file_metadata, media_body=media, fields="id"
+                    ).execute(num_retries=3)
+                    print(f"Додано новий: {task['full_ftp_path']}", flush=True)
+
+                uploaded_count += 1
+                break
+            except Exception as err:
+                if attempt == 5:
+                    print(f"Помилка запису {task['name']} на Диск: {err}", flush=True)
+                else:
+                    time.sleep(attempt * 2)
+
+    return uploaded_count
+
+
 def main():
+    start_ts = time.time()
     now = datetime.now(KYIV_TZ)
     if now.hour < 2:
         dates_to_check = [now - timedelta(days=1), now]
@@ -444,63 +498,35 @@ def main():
 
     print(f"Кандидатів на перевірку: {len(tasks)}", flush=True)
 
-    num_workers = min(8, max(1, len(tasks)))
-    batches = [tasks[i::num_workers] for i in range(num_workers)] if tasks else []
+    ftp_workers = min(16, max(1, len(tasks)))
+    ftp_batches = [tasks[i::ftp_workers] for i in range(ftp_workers)] if tasks else []
 
     downloaded_items = []
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    with ThreadPoolExecutor(max_workers=ftp_workers) as executor:
         futures = [
             executor.submit(check_and_download_chunk, batch, active_cfg)
-            for batch in batches
+            for batch in ftp_batches
         ]
         for future in as_completed(futures):
             downloaded_items.extend(future.result())
 
+    print(f"Готово до запису на Google Диск: {len(downloaded_items)} файлів", flush=True)
+
     total_changed = 0
-    for task, file_bytes, current_sha256, ftp_mtime in downloaded_items:
-        existing_info = task["existing_info"]
+    if downloaded_items:
+        drive_workers = min(10, len(downloaded_items))
+        drive_batches = [downloaded_items[i::drive_workers] for i in range(drive_workers)]
+        with ThreadPoolExecutor(max_workers=drive_workers) as executor:
+            futures = [
+                executor.submit(upload_drive_chunk, batch)
+                for batch in drive_batches
+            ]
+            for future in as_completed(futures):
+                total_changed += future.result()
 
-        if existing_info and existing_info["sha256"] == current_sha256:
-            continue
-
-        bio = io.BytesIO(file_bytes)
-        media = MediaIoBaseUpload(bio, mimetype="application/octet-stream", resumable=True)
-        app_props = {
-            "content_sha256": current_sha256,
-            "ftp_mtime": ftp_mtime,
-        }
-
-        for attempt in range(1, 6):
-            try:
-                if existing_info:
-                    drive.files().update(
-                        fileId=existing_info["id"],
-                        body={"appProperties": app_props},
-                        media_body=media,
-                        fields="id",
-                    ).execute(num_retries=5)
-                    print(f"Оновлено (змінився вміст): {task['full_ftp_path']}", flush=True)
-                else:
-                    file_metadata = {
-                        "name": task["name"],
-                        "parents": [task["drive_folder_id"]],
-                        "appProperties": app_props,
-                    }
-                    drive.files().create(
-                        body=file_metadata, media_body=media, fields="id"
-                    ).execute(num_retries=5)
-                    print(f"Додано новий: {task['full_ftp_path']}", flush=True)
-
-                total_changed += 1
-                break
-            except Exception as err:
-                if attempt == 5:
-                    print(f"Помилка запису {task['name']} на Диск: {err}", flush=True)
-                else:
-                    time.sleep(attempt * 3)
-
+    elapsed = round(time.time() - start_ts, 1)
     active_target = active_cfg.get("resolved_ip") or active_cfg["host"]
-    print(f"Перевірку завершено ({active_target}). Додано або оновлено файлів: {total_changed}", flush=True)
+    print(f"Перевірку завершено ({active_target}) за {elapsed} сек. Додано або оновлено файлів: {total_changed}", flush=True)
 
 
 if __name__ == "__main__":
