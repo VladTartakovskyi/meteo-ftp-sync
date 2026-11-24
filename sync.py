@@ -133,18 +133,25 @@ def connect_to_ftp(cfg, timeout=20):
     return ftp
 
 
-def get_working_ftp(ftp_configs):
-    """Перевіряє основний FTP-сервер, а якщо він не працює — перемикається на резервний"""
+def get_working_ftp(ftp_configs, max_rounds=3, retry_delay=5):
+    """Перевіряє основний і резервний FTP-сервери з повторними спробами при тимчасових збоях DNS/мережі"""
     last_error = None
-    for cfg in ftp_configs:
-        try:
-            ftp = connect_to_ftp(cfg, timeout=15)
-            print(f"Підключено до FTP ({cfg['label']}): {cfg['host']}", flush=True)
-            return ftp, cfg
-        except Exception as e:
-            print(f"Сервер {cfg['host']} ({cfg['label']}) недоступний ({e}), пробую наступний...", flush=True)
-            last_error = e
-    raise ConnectionError(f"Жоден із FTP-серверів не відповідає. Остання помилка: {last_error}")
+    for round_num in range(1, max_rounds + 1):
+        for cfg in ftp_configs:
+            try:
+                ftp = connect_to_ftp(cfg, timeout=15)
+                print(f"Підключено до FTP ({cfg['label']}): {cfg['host']}", flush=True)
+                return ftp, cfg
+            except Exception as e:
+                print(
+                    f"[Спроба {round_num}/{max_rounds}] Сервер {cfg['host']} ({cfg['label']}) недоступний ({e}), пробую наступний...",
+                    flush=True,
+                )
+                last_error = e
+        if round_num < max_rounds:
+            time.sleep(retry_delay)
+
+    raise ConnectionError(f"Жоден із FTP-серверів не відповідає після {max_rounds} спроб. Остання помилка: {last_error}")
 
 
 def get_or_create_folder(service, name, parent_id):
