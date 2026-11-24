@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import struct
 import hashlib
 import socket
 import ftplib
@@ -35,6 +36,50 @@ def is_target_file(filename, download_all, target_prefixes):
         return True
     name_low = filename.lower()
     return name_low.startswith(target_prefixes)
+
+
+def resolve_via_public_dns(domain, dns_servers=("8.8.8.8", "1.1.1.1")):
+    """Отримує IPv4-адресу напряму через публічні DNS (8.8.8.8 / 1.1.1.1), якщо системний DNS впав"""
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", domain):
+        return domain
+
+    qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in domain.strip(".").split(".")) + b"\x00"
+    query = b"\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname + b"\x00\x01\x00\x01"
+
+    for dns_ip in dns_servers:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(4)
+            sock.sendto(query, (dns_ip, 53))
+            data, _ = sock.recvfrom(512)
+            ancount = struct.unpack("!H", data[6:8])[0]
+            if ancount == 0:
+                continue
+
+            idx = 12
+            while data[idx] != 0:
+                idx += data[idx] + 1
+            idx += 5
+
+            for _ in range(ancount):
+                if (data[idx] & 0xC0) == 0xC0:
+                    idx += 2
+                else:
+                    while data[idx] != 0:
+                        idx += data[idx] + 1
+                    idx += 1
+                rtype, _, _, rdlength = struct.unpack("!HHIH", data[idx:idx + 10])
+                idx += 10
+                if rtype == 1 and rdlength == 4:
+                    return socket.inet_ntoa(data[idx:idx + 4])
+                idx += rdlength
+        except Exception:
+            continue
+        finally:
+            if sock:
+                sock.close()
+    return None
 
 
 def get_drive_service():
@@ -93,7 +138,6 @@ def get_sheet_settings(drive):
     if not configs:
         raise ValueError("У клітинках C2:E2 та C3:E3 відсутні коректні дані для підключення до FTP")
 
-    # Зчитуємо стовпчик H (назви/префікси) та стовпчик I (TRUE/FALSE), починаючи з 2-го рядка
     download_all = False
     prefixes = []
 
@@ -127,14 +171,15 @@ def get_sheet_settings(drive):
 
 
 def connect_to_ftp(cfg, timeout=20):
-    ftp = ftplib.FTP(cfg["host"], timeout=timeout)
+    target_host = cfg.get("resolved_ip") or cfg["host"]
+    ftp = ftplib.FTP(target_host, timeout=timeout)
     ftp.login(cfg["user"], cfg["pass"])
     ftp.set_pasv(True)
     return ftp
 
 
 def get_working_ftp(ftp_configs, max_rounds=3, retry_delay=5):
-    """Перевіряє основний і резервний FTP-сервери з повторними спробами при тимчасових збоях DNS/мережі"""
+    """Перевіряє FTP-сервери з повторними спробами; при збої DNS підключається по прямому IP через 8.8.8.8/1.1.1.1"""
     last_error = None
     for round_num in range(1, max_rounds + 1):
         for cfg in ftp_configs:
@@ -144,10 +189,27 @@ def get_working_ftp(ftp_configs, max_rounds=3, retry_delay=5):
                 return ftp, cfg
             except Exception as e:
                 print(
-                    f"[Спроба {round_num}/{max_rounds}] Сервер {cfg['host']} ({cfg['label']}) недоступний ({e}), пробую наступний...",
+                    f"[Спроба {round_num}/{max_rounds}] Сервер {cfg['host']} ({cfg['label']}) недоступний ({e})",
                     flush=True,
                 )
                 last_error = e
+
+                if (
+                    "Name or service not known" in str(e)
+                    or "Temporary failure in name resolution" in str(e)
+                    or "gaierror" in str(type(e))
+                ):
+                    direct_ip = resolve_via_public_dns(cfg["host"])
+                    if direct_ip and direct_ip != cfg["host"]:
+                        try:
+                            ip_cfg = {**cfg, "resolved_ip": direct_ip}
+                            ftp = connect_to_ftp(ip_cfg, timeout=15)
+                            print(f"Підключено напряму по IP ({cfg['label']}): {direct_ip} ({cfg['host']})", flush=True)
+                            return ftp, ip_cfg
+                        except Exception as ip_err:
+                            print(f"Прямий IP {direct_ip} також недоступний ({ip_err})", flush=True)
+                            last_error = ip_err
+
         if round_num < max_rounds:
             time.sleep(retry_delay)
 
@@ -427,7 +489,8 @@ def main():
                 else:
                     time.sleep(attempt * 3)
 
-    print(f"Перевірку завершено ({active_cfg['host']}). Додано або оновлено файлів: {total_changed}", flush=True)
+    active_target = active_cfg.get("resolved_ip") or active_cfg["host"]
+    print(f"Перевірку завершено ({active_target}). Додано або оновлено файлів: {total_changed}", flush=True)
 
 
 if __name__ == "__main__":
